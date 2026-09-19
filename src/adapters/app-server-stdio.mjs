@@ -24,6 +24,14 @@ const TURN_START_KEYS = new Set([
 /** Parameters `review/start` accepts on this protocol version. */
 const REVIEW_START_KEYS = new Set(["threadId", "target", "delivery"]);
 
+/** Parameters `thread/resume` accepts on this protocol version. */
+const THREAD_RESUME_KEYS = new Set([
+  "threadId", "cwd", "model", "modelProvider", "sandbox", "permissions",
+  "approvalPolicy", "approvalsReviewer", "baseInstructions", "developerInstructions",
+  "personality", "serviceTier", "config", "excludeTurns", "initialTurnsPage",
+  "runtimeWorkspaceRoots",
+]);
+
 /** Review targets accepted by `review/start` on this protocol version. */
 const REVIEW_TARGETS = new Set(["uncommittedChanges", "baseBranch", "commit", "custom"]);
 
@@ -175,6 +183,39 @@ export class AppServerStdio {
     const turnId = started.turn?.id ?? null;
     const turn = await this.waitForTurn({ threadId: params.threadId, turnId });
     return { turn, turnId };
+  }
+
+  /**
+   * Reattach to an existing thread by id and return its server-reported state.
+   *
+   * This is the whole of Fusion's restart story: Fusion stores only
+   * `task -> executorThreadId`, and uses `thread/resume` to rejoin that thread.
+   * It does not replay a transcript and does not reconstruct Codex context —
+   * the thread's history lives with Codex, not with Fusion.
+   *
+   * The response is also the only trustworthy source for identity binding: it
+   * reports the thread id, the workspace the server actually opened (`cwd`,
+   * absolutely normalized), and the model/provider/sandbox in force. A local
+   * path comparison cannot establish that, because Fusion would be comparing a
+   * stored string against itself.
+   */
+  async resumeThread(params = {}) {
+    assertKnownKeys(params, THREAD_RESUME_KEYS, "thread/resume");
+    if (!params.threadId) throw new Error("thread/resume requires a threadId");
+    // Full-history hydration is deprecated for paginated threads and Fusion does
+    // not consume the transcript, so ask for metadata only.
+    return this.request("thread/resume", { excludeTurns: true, ...params });
+  }
+
+  /**
+   * Describe an existing thread without resuming it.
+   *
+   * `thread/read` reports the thread's own view of itself, including its `cwd`.
+   * Used by the identity check to verify a binding independently of resume.
+   */
+  async readThread({ threadId, includeTurns = false } = {}) {
+    if (!threadId) throw new Error("thread/read requires a threadId");
+    return this.request("thread/read", { threadId, includeTurns });
   }
 
   /**

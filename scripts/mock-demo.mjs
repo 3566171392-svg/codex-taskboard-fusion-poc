@@ -57,6 +57,15 @@ const executor = {
 const reviewerThreads = [];
 let reviewCount = 0;
 const appServer = {
+  // The Gate's identity evidence comes from the server's own view of the bound
+  // thread. A fake that cannot report it makes the Gate fail closed — which is
+  // the intended behaviour, so the fake must report it like the real one does.
+  async readThread({ threadId }) {
+    return { thread: { id: threadId, cwd: executorBinding.workspacePath } };
+  },
+  async resumeThread({ threadId }) {
+    return { thread: { id: threadId }, cwd: executorBinding.workspacePath };
+  },
   async startThread({ sandbox }) {
     if (sandbox !== "read-only") throw new Error(`reviewer thread must be read-only, got ${sandbox}`);
     const id = `reviewer-thread-${reviewerThreads.length + 1}`;

@@ -16,6 +16,115 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Normalize a path for identity comparison.
+ *
+ * Windows paths are case-insensitive and may arrive with either separator, a
+ * trailing separator, or a different drive-letter case. Comparing raw strings
+ * would produce false mismatches, and — worse — a false *match* is impossible to
+ * get wrong in the safe direction, so the normalization must only ever make two
+ * genuinely identical locations compare equal.
+ */
+export function normalizeWorkspacePath(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  let p = value.trim().replace(/[\\/]+/g, "/").replace(/\/+$/, "");
+  if (p === "") return null;
+  // A drive-letter prefix is case-insensitive on Windows.
+  p = p.replace(/^([A-Za-z]):/, (_m, drive) => `${drive.toLowerCase()}:`);
+  return process.platform === "win32" ? p.toLowerCase() : p;
+}
+
+/**
+ * Build the Gate's identity evidence from server-observed facts.
+ *
+ * This exists because the Gate treats `identityMatches` as a PASS condition. An
+ * earlier revision checked that field while nothing ever produced it, so the
+ * check silently never fired — a security check with no evidence behind it.
+ *
+ * `identityMatches` is true only when all of the following hold, each verified
+ * against something the App Server reported rather than against a value Fusion
+ * stored itself:
+ *
+ *   1. the thread the binding names still exists and reports that same id,
+ *   2. the server reports a `cwd` for that thread,
+ *   3. that `cwd` is the workspace the binding claims, and
+ *   4. that workspace matches the one the evidence was collected from.
+ *
+ * Returns the evidence plus a `reasons` list, so a mismatch is diagnosable
+ * rather than just a boolean. Any error while observing produces
+ * `identityMatches: false` — failing closed, never open.
+ */
+export async function collectIdentityEvidence({
+  appServer,
+  executorBinding,
+  workspacePath = executorBinding?.workspacePath ?? null,
+  verifyThread = true,
+} = {}) {
+  const binding = executorBinding ?? {};
+  const expectedWorkspace = normalizeWorkspacePath(binding.workspacePath);
+  const evidenceWorkspace = normalizeWorkspacePath(workspacePath);
+  const reasons = [];
+  const threadId = binding.threadId ?? null;
+
+  if (!threadId) reasons.push("executor binding carries no threadId");
+  if (!expectedWorkspace) reasons.push("executor binding carries no workspacePath");
+  if (!evidenceWorkspace) reasons.push("no workspacePath supplied for evidence collection");
+  if (expectedWorkspace && evidenceWorkspace && expectedWorkspace !== evidenceWorkspace) {
+    reasons.push(
+      `evidence was collected from ${workspacePath} but the binding claims ${binding.workspacePath}`,
+    );
+  }
+
+  let observedThreadId = null;
+  let observedCwd = null;
+  let observedNormalized = null;
+  let observed = false;
+  let observationError = null;
+
+  if (verifyThread && appServer && threadId) {
+    try {
+      const read = await appServer.readThread({ threadId, includeTurns: false });
+      const thread = read?.thread ?? null;
+      observed = true;
+      observedThreadId = thread?.id ?? null;
+      observedCwd = thread?.cwd ?? null;
+      observedNormalized = normalizeWorkspacePath(observedCwd);
+      if (observedThreadId !== threadId) {
+        reasons.push(`server returned thread ${observedThreadId} for requested thread ${threadId}`);
+      }
+      if (!observedCwd) {
+        reasons.push("server reported no cwd for the bound thread");
+      }
+    } catch (error) {
+      observationError = String(error);
+      reasons.push(`could not observe the bound thread: ${observationError}`);
+    }
+  } else if (verifyThread && !appServer) {
+    reasons.push("no app server available to observe the bound thread");
+  }
+
+  if (observedNormalized && expectedWorkspace && observedNormalized !== expectedWorkspace) {
+    reasons.push(
+      `the bound thread's workspace is ${observedCwd}, not the binding's ${binding.workspacePath}`,
+    );
+  }
+
+  const identityMatches = reasons.length === 0;
+
+  return {
+    identityMatches,
+    reasons,
+    boundThreadId: threadId,
+    observedThreadId,
+    observedCwd,
+    expectedWorkspace: binding.workspacePath ?? null,
+    evidenceWorkspace: workspacePath ?? null,
+    threadObserved: observed,
+    observationError,
+    source: observed ? "thread/read (app server)" : "unverified",
+  };
+}
+
 /** Directories that are never part of the reviewable content. */
 const SKIP_DIRS = new Set([".git", "node_modules", "__pycache__", ".live", ".poc", "dist", "build"]);
 

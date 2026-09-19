@@ -65,12 +65,65 @@ thread before the review, not by detached delivery.
 | Layer | Checks | Failure |
 | --- | --- | --- |
 | A. Reviewer completion | reviewer thread exists, is not the executor thread, sandbox is read-only, review turn status `completed`, no turn error, review lifecycle observed | BLOCKED |
-| B. Verdict extraction | exactly one `VERDICT: PASS` or `VERDICT: FAIL` line; both markers or neither is ambiguous | BLOCKED |
-| C. Machine evidence | required verification commands pass, workspace identity matches, no notification history loss | FAIL when a check fails, BLOCKED on identity/history problems |
+| B. Verdict extraction | exactly one `VERDICT: PASS` or `VERDICT: FAIL` line. No marker, both markers, or a repeated marker is ambiguous | BLOCKED |
+| C. Machine evidence | required verification commands pass, workspace identity is **established**, no notification history loss | FAIL when a check fails, BLOCKED on identity/history problems |
 
 Machine evidence is evaluated **before** the reviewer's opinion, so failing
 tests always reach the executor instead of stalling as BLOCKED. A PASS needs
 both the marker and passing machine evidence; prose alone is never a PASS.
+
+### Identity evidence is server-observed, and fails closed
+
+Layer C checks `identityMatches`, so that field needs a real source. An earlier
+revision checked it while nothing produced it, and tested only
+`identityMatches === false` — so evidence that simply omitted the field passed by
+omission, and the check never fired.
+
+The Gate now collects it itself, from the App Server's own view of the bound
+thread (`thread/read`), and requires all of:
+
+1. the bound thread still exists and reports that same id,
+2. the server reports a `cwd` for it,
+3. that `cwd` is the workspace the binding claims, and
+4. that workspace is the one the evidence was collected from.
+
+`identityMatches` must be exactly `true`; `false`, missing, or unobservable are
+all BLOCKED. Paths are normalized for case and separators before comparison, so
+different spellings of the same location match while different locations never
+can.
+
+### Task status decides whether work may start at all
+
+Only `todo`, `in_progress` and `todo` (review-rejected) are runnable. Everything
+else fails closed:
+
+| Task status | Resume action |
+| --- | --- |
+| `todo`, `in_progress`, review-rejected | `run` |
+| `in_review` | `await_human` |
+| `backlog` | `not_approved` — dashi treats backlog as not approved for execution |
+| `blocked` | `blocked` |
+| `done` | `done` |
+| `canceled` | `canceled` |
+| anything unrecognized | `unknown_status` |
+
+The earlier mapping ended in `else action = "run"`, so `backlog`, `canceled` and
+any unknown status all fell through to "start executing".
+
+### Restart semantics
+
+Fusion stores only `task -> executorThreadId`. It does not replay a transcript
+and does not rebuild Codex context: on restart it calls `thread/resume` and the
+conversation history stays with Codex.
+
+- A restart is identified by **durable attempt history**, not by status. A first
+  run has no attempts and its thread was just created, so nothing is resumed —
+  resuming a thread that has not run a turn fails with `-32600 no rollout found`.
+- An executor that presents a different thread than the task is bound to is a
+  conflict, refused rather than silently merged.
+- A failed `thread/resume` blocks the task; it never falls back to a fresh thread.
+- Attempt numbering continues from the durable records, so a restart cannot
+  refresh the `maxAttempts` budget or produce two records numbered `attempt: 1`.
 
 ## Thin Gate responsibilities
 
@@ -91,20 +144,22 @@ The POC owns only:
 ## Gate verdicts
 
 ```text
-PASS     independent reviewer thread + read-only sandbox + review turn completed
-         + review lifecycle observed + exactly one "VERDICT: PASS" line
-         + machine evidence passed
+PASS     independent reviewer thread + read-only sandbox + turn completed
+         + lifecycle observed + exactly one `VERDICT: PASS`
+         + machine evidence passed + identity established
 
 FAIL     machine verification failed              (failureKind: deterministic_verification)
-         or exactly one "VERDICT: FAIL" line
+         or exactly one `VERDICT: FAIL`
 
 BLOCKED  reviewer thread could not be created, was not independent, or was
-         not read-only; turn did not complete; no verdict line, or both verdict
-         lines (ambiguous); notification history lost; attempts exhausted
+         not read-only; turn did not complete or reported an error; lifecycle
+         missing; no verdict marker, both markers, or a repeated marker;
+         workspace identity not established; notification history lost;
+         attempt budget exhausted; executor thread could not be resumed
 ```
 
-Machine evidence is evaluated before the reviewer's verdict, so a failing test
-always reaches the executor instead of stalling as BLOCKED.
+Machine-verification failure is evaluated before the reviewer's verdict, so
+failing tests always reach the executor instead of stalling as BLOCKED.
 
 ## Deliberate non-responsibilities
 

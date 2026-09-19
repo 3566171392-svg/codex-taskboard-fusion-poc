@@ -28,11 +28,23 @@ export const INCORRECT = "patch is incorrect";
 /**
  * Extract exactly one verdict marker from review output.
  *
- * Rules, in order:
+ * The contract is strictly fail-closed. Accepted inputs and their verdicts:
+ *
+ *   no marker at all            -> BLOCKED
+ *   exactly one `VERDICT: PASS` -> PASS
+ *   exactly one `VERDICT: FAIL` -> FAIL
+ *   PASS and FAIL together      -> BLOCKED   (the reviewer contradicted itself)
+ *   more than one PASS          -> BLOCKED   (ambiguous which one governs)
+ *   more than one FAIL          -> BLOCKED
+ *
+ * A repeated identical marker is **not** accepted. An earlier revision let the
+ * last occurrence win, which meant output that both passed and failed — or that
+ * restated its verdict — produced a confident answer. Ambiguity must stop the
+ * Gate, not be resolved by position.
+ *
+ * Additional rules:
  *   - the marker must appear on its own line (leading/trailing space allowed)
- *   - PASS and FAIL appearing together is ambiguous -> BLOCKED
- *   - no marker -> BLOCKED
- *   - the last occurrence wins only when it is the same marker repeated
+ *   - surrounding markdown decoration (`**VERDICT: PASS**`) is tolerated
  *
  * Returns `{ verdict: "PASS" | "FAIL" | null, marker, reason, occurrences }`.
  */
@@ -77,7 +89,17 @@ export function extractVerdict(text) {
     };
   }
   const isPass = passLines.length > 0;
-  const lineIndex = isPass ? passLines[passLines.length - 1] : failLines[failLines.length - 1];
+  const count = isPass ? passLines.length : failLines.length;
+  if (count > 1) {
+    const label = isPass ? "VERDICT: PASS" : "VERDICT: FAIL";
+    return {
+      verdict: null,
+      marker: null,
+      reason: `reviewer emitted ${label} ${count} times (ambiguous which marker governs)`,
+      occurrences,
+    };
+  }
+  const lineIndex = isPass ? passLines[0] : failLines[0];
   return {
     verdict: isPass ? "PASS" : "FAIL",
     marker: isPass ? VERDICT_MARKER.PASS : VERDICT_MARKER.FAIL,

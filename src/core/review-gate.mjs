@@ -30,13 +30,17 @@ import {
   extractFindings,
   extractVerdict,
 } from "./review-contract.mjs";
+import { collectIdentityEvidence } from "./evidence.mjs";
 
 export const STATES = Object.freeze({
+  BACKLOG: "backlog",
+  TODO: "todo",
   IN_PROGRESS: "in_progress",
   IN_REVIEW: "in_review",
   DONE: "done",
   REJECTED: "todo",
   BLOCKED: "blocked",
+  CANCELED: "canceled",
 });
 
 export const VERDICTS = Object.freeze({ PASS: "PASS", FAIL: "FAIL", BLOCKED: "BLOCKED" });
@@ -85,8 +89,14 @@ export function checkMachineEvidence({
       `(enteredReviewMode: ${reviewMode?.entered ?? 0}, exitedReviewMode: ${reviewMode?.exited ?? 0})`,
     );
   }
-  if (evidence.identityMatches === false) {
-    return blocked("workspace identity did not match the executor binding");
+  // Identity is fail-closed in both directions: `false` is a mismatch, and so is
+  // a missing value. An earlier revision only tested `=== false`, so evidence
+  // that never carried the field passed the check by omission.
+  if (evidence.identityMatches !== true) {
+    const detail = Array.isArray(evidence.identityReasons) && evidence.identityReasons.length > 0
+      ? `: ${evidence.identityReasons.join("; ")}`
+      : "";
+    return blocked(`workspace identity was not established${detail}`);
   }
   if (evidence.allChecksPassed === false) {
     return {
@@ -128,8 +138,8 @@ export function deriveReviewVerdict({
 
   // Layer A — a PASS still has to survive the evidence gate above. Reaching this
   // point means both layers passed.
-  if (evidence.identityMatches === false) {
-    return blocked("workspace identity did not match the executor binding");
+  if (evidence.identityMatches !== true) {
+    return blocked("workspace identity was not established");
   }
   return {
     verdict: VERDICTS.PASS,
@@ -228,6 +238,15 @@ export async function executeNativeReviewGate({
   reviewScope = [],
   requireLifecycle = true,
   /**
+   * Number the first attempt of this invocation.
+   *
+   * A restarted process must continue the durable attempt sequence rather than
+   * restart it at 1: otherwise the Taskboard ends up with two records both
+   * claiming `attempt: 1`, and `maxAttempts` is silently refreshed on every
+   * restart instead of being a real budget.
+   */
+  firstAttempt = 1,
+  /**
    * Called once per review attempt with a durable record:
    * `{ attempt, executorThreadId, reviewerThreadId, verdict, reviewLifecycle,
    *    machineEvidence, at }`. The Gate owns the event; the caller decides how
@@ -238,7 +257,30 @@ export async function executeNativeReviewGate({
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
     throw new Error("maxAttempts must be a positive integer");
   }
+  if (!Number.isInteger(firstAttempt) || firstAttempt < 1) {
+    throw new Error("firstAttempt must be a positive integer");
+  }
   assertBinding(executor.binding);
+
+  // The attempt budget is total, not per-process. A task that already used its
+  // attempts must not get a fresh allowance because Fusion restarted.
+  if (firstAttempt > maxAttempts) {
+    await taskboard.addComment(taskId, {
+      body:
+        `Review Gate BLOCKED: the attempt budget is exhausted ` +
+        `(next attempt would be ${firstAttempt}, maxAttempts is ${maxAttempts}).`,
+      binding: executor.binding,
+    });
+    await taskboard.moveTask(taskId, STATES.BLOCKED, (await taskboard.getTask(taskId)).version, executor.binding);
+    return {
+      status: VERDICTS.BLOCKED,
+      attempt: firstAttempt,
+      trace: [{ event: "gate.blocked", attempt: firstAttempt, reason: "attempt budget exhausted" }],
+      review: null,
+      reviewerThreadIds: [],
+      budgetExhausted: true,
+    };
+  }
 
   const trace = [];
   const reviewerThreadIds = [];
@@ -249,10 +291,22 @@ export async function executeNativeReviewGate({
   // Workspace state at the moment the executor claims it is done.
   const fingerprintBefore = evidenceProvider?.fingerprintWorkspace?.() ?? null;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  for (let attempt = firstAttempt; attempt <= maxAttempts; attempt += 1) {
     const freshTask = await taskboard.getTask(taskId);
 
     // ---- Layer C input: real machine evidence -----------------------------
+    //
+    // Identity evidence is collected by the Gate itself, from the App Server,
+    // and merged into whatever the caller's evidence provider returned. It is
+    // deliberately not delegated: a provider could omit the field, and it would
+    // then be absent rather than false — which is exactly how the previous
+    // `=== false` check passed by omission.
+    const identity = await collectIdentityEvidence({
+      appServer,
+      executorBinding: executor.binding,
+      workspacePath: executor.binding.workspacePath,
+    });
+
     let evidence;
     try {
       evidence = evidenceProvider
@@ -268,10 +322,27 @@ export async function executeNativeReviewGate({
       return { status: VERDICTS.BLOCKED, attempt, trace, review: null, reviewerThreadIds };
     }
 
-    if (evidence.identityMatches === false) {
-      trace.push({ event: "gate.blocked", attempt, reason: "identity mismatch" });
+    evidence.identityMatches = identity.identityMatches;
+    evidence.identityReasons = identity.reasons;
+    evidence.identity = identity;
+
+    trace.push({
+      event: "gate.identity",
+      attempt,
+      identityMatches: identity.identityMatches,
+      reasons: identity.reasons,
+      source: identity.source,
+      boundThreadId: identity.boundThreadId,
+      observedThreadId: identity.observedThreadId,
+      observedCwd: identity.observedCwd,
+    });
+
+    if (identity.identityMatches !== true) {
+      trace.push({ event: "gate.blocked", attempt, reason: "identity not established" });
       await taskboard.addComment(taskId, {
-        body: `Review Gate BLOCKED (attempt ${attempt}): workspace identity mismatch`,
+        body:
+          `Review Gate BLOCKED (attempt ${attempt}): workspace identity was not established.\n` +
+          identity.reasons.map((r) => `- ${r}`).join("\n"),
         binding: executor.binding,
       });
       await taskboard.moveTask(taskId, STATES.BLOCKED, (await taskboard.getTask(taskId)).version, executor.binding);

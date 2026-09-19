@@ -41,9 +41,20 @@ VERDICT: PASS
 VERDICT: FAIL
 ```
 
-Nothing else counts. Both markers, or neither, is BLOCKED — the Gate never
-infers a verdict from prose. A PASS additionally requires the machine evidence
-to pass, so the reviewer's opinion alone can never release a task.
+The contract is fail-closed, and the count matters:
+
+| Reviewer output | Verdict |
+| --- | --- |
+| exactly one `VERDICT: PASS` | PASS candidate (machine evidence still has to pass) |
+| exactly one `VERDICT: FAIL` | FAIL |
+| no marker | BLOCKED |
+| `PASS` and `FAIL` together | BLOCKED |
+| the same marker twice | BLOCKED |
+
+The Gate never infers a verdict from prose, and never lets position decide an
+ambiguous one. A PASS additionally requires the machine evidence to pass and the
+workspace identity to be established, so the reviewer's opinion alone can never
+release a task.
 
 `review/start` with `delivery: "detached"` is not used: Codex deprecates it,
 refuses it on paginated threads, and that path never emits the review lifecycle.
@@ -67,7 +78,7 @@ workspace containing a genuine failing test:
 ```powershell
 $env:CODEX_HOME           = "D:\poc\v2-codex-home"   # disposable home
 $env:FUSION_POC_WORKSPACE = "D:\poc\gate-demo"
-$env:FUSION_POC_MODEL = "<your-model>"
+$env:FUSION_POC_MODEL = "<model-a>"
 
 npm run make-demo-workspace     # writes only under D:\poc
 node scripts/trust-demo-workspace.mjs

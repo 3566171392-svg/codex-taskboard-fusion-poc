@@ -11,9 +11,67 @@ with inline delivery. The verdict travels as one explicit line
 
 | Command | Exit | Result |
 | --- | --- | --- |
-| `npm test` | 0 | 40 tests, 0 fail |
+| `npm test` | 0 | 79 tests, 0 fail |
 | `npm run lint` | 0 | all sources and scripts parse |
 | `npm run demo` | 0 | FAIL -> same executor -> new reviewer -> PASS, `READY_FOR_ACCEPTANCE`, `autoCompleted: false` |
+
+## Correctness pass: three checks that were not actually firing
+
+This revision fixed three places where the Gate looked stricter than it was.
+None of them was a research question; each was a defect with a failing test.
+
+| Defect | Evidence | Fix |
+| --- | --- | --- |
+| Any unknown status resolved to `run`. The mapping ended in `else action = "run"`, so `backlog` and `canceled` both started executing. | `backlog` is not approved for execution in dashi's own rules; an assignee alone is not authorization. | Explicit `RUNNABLE_STATES`; every other status maps to a stop action, and an unrecognized status is `unknown_status`. |
+| `identityMatches` was a PASS condition that nothing ever produced, and was tested as `=== false`. | Evidence that omitted the field passed by omission, so the check never fired. | Real server-observed identity (below), requiring exactly `true`. |
+| A repeated `VERDICT:` marker was accepted, last one winning. | `VERDICT: PASS … VERDICT: PASS` returned PASS; so did contradictory output resolved by position. | Duplicate markers are BLOCKED. Only exactly one marker yields a verdict. |
+
+## The verdict contract is fail-closed
+
+| Reviewer output | Verdict |
+| --- | --- |
+| exactly one `VERDICT: PASS` | PASS candidate |
+| exactly one `VERDICT: FAIL` | FAIL |
+| no marker | BLOCKED |
+| `PASS` and `FAIL` together | BLOCKED |
+| the same marker twice | BLOCKED |
+
+## Identity evidence, from the App Server
+
+`core/evidence.mjs::collectIdentityEvidence` verifies the binding against what
+the server reports for the bound thread, so a PASS cannot rest on a value Fusion
+stored itself. Measured on this machine:
+
+```json
+{
+  "expectedWorkspace": "D:\\poc\\uncommitted-review-probe",
+  "observedCwd":       "D:\\poc\\uncommitted-review-probe",
+  "observedThreadId":  "<same as the binding>",
+  "identityMatches": true,
+  "source": "thread/read (app server)"
+}
+```
+
+Negative controls, all fail-closed: a different workspace, a foreign thread id
+(`-32600 thread not loaded`), and a binding with no thread id.
+
+## Restart and resume — real, on dashi
+
+`scripts/live-dashi-e2e.mjs` runs the real thing. Results from this machine:
+
+| Scenario | Result |
+| --- | --- |
+| Fresh run | Executor A -> machine evidence `exitCode 1` -> Reviewer B `VERDICT: FAIL` -> A repairs -> machine evidence `exitCode 0` -> Reviewer C `VERDICT: PASS` -> `in_review` |
+| Crash before repair | Process exited inside `repair()`; workspace untouched (`git status` clean) |
+| Resume | New process: `thread/resume(A)` -> repair on the same A -> C passes. `threadIdUnchanged: true`, attempts continued 1 -> 2 -> 3 |
+| Restart while `in_review` | New process: `await_human`, `attemptedWork: false`, **zero** app-server calls |
+| Restart while `blocked` | Stays `blocked`, `attemptedWork: false`, zero app-server calls |
+| Backlog / canceled on real dashi | `not_approved` / `canceled`, zero app-server calls, task and version unchanged |
+
+One real defect surfaced only here and is fixed: the first run of a brand-new
+task called `thread/resume` on a thread that had not run a turn yet, and the
+server rejected it with `-32600 no rollout found`, blocking the task before any
+work. A first run has no durable attempt history, so it must not resume.
 
 ## Verified on this Windows machine (real app-server + real model)
 
@@ -28,33 +86,6 @@ with inline delivery. The verdict travels as one explicit line
   "detachedRefusedByAdapter": "review/start delivery \"detached\" is not supported by this POC"
 }
 ```
-
-`entered` / `exited` arrive as two notifications each (`item/started` and
-`item/completed`), so a **single** review turn reports `2 / 2`. The count is
-lifecycle events, not reviews; the Gate's threshold (`>= 1`) is the correct one.
-
-## Native review scope and reviewer sandbox (probed, not assumed)
-
-`scripts/v0.4-probes/` measured two questions this architecture depends on.
-Full findings and their limits: `docs/RESEARCH-NATIVE-REVIEW-SCOPE.md`.
-
-| Question | Measurement |
-| --- | --- |
-| Does Codex enumerate the working tree itself? | Yes, for both `target: uncommittedChanges` and `target: custom`. Modified, staged and untracked changes were all found, and a clean control file was explicitly listed as *unchanged, not a change*. |
-| Does the caller need to supply a diff or a changed-file list? | No. Nothing was supplied; the reviewer ran the repo's own test command and found all three planted defects from the files alone. |
-| Can `uncommittedChanges` carry the verdict? | No. It emitted no `VERDICT:` marker at all, ending with a prose question. `custom` emitted `VERDICT: FAIL` as its final line. `custom` remains the only channel that carries both the task contract and the verdict marker. |
-| Is `read-only` enforced during a native review? | Yes. Ordered to create a file, overwrite a tracked file, delete a tracked file and commit: nothing changed under `read-only`, while `workspace-write` on an identical repo created and overwrote files. Refusals were `UnauthorizedAccessException` / `Permission denied` / `.git/index.lock: Permission denied`. |
-| Does the reviewer write to git? | No commits under either sandbox — `.git` is protected independently of the thread sandbox. |
-
-Consequences, none of which change the Gate:
-
-- `custom` target stays; it is a limitation of this build, not a preference.
-- `read-only` + fail-closed stays as a PASS condition; it is load-bearing.
-- No Fusion-side diff generation or review-scope construction was added, because
-  Codex already covers it. `reviewScope` remains an optional narrowing hint.
-- Git state and the workspace fingerprint stay as provenance for the durable
-  attempt record. They are **not** verdict inputs: the only evidence fields that
-  can change a verdict are `identityMatches` and `allChecksPassed`.
 
 `npm run live-gate-demo` (full Gate, real workspace with a real defect):
 
@@ -76,17 +107,18 @@ added.
 
 | Verdict | Produced by |
 | --- | --- |
-| PASS | independent read-only reviewer + review turn completed + lifecycle observed + exactly one `VERDICT: PASS` + machine checks passed + identity matched |
-| FAIL | a `VERDICT: FAIL`, or failing machine verification (checked first, so failing tests always reach the executor) |
-| BLOCKED | reviewer not independent / not read-only, turn aborted, lifecycle missing, no verdict or an ambiguous one, identity mismatch, notification history lost, attempts exhausted |
+| PASS | independent read-only reviewer + review turn completed + lifecycle observed + exactly one `VERDICT: PASS` + machine checks passed + identity established |
+| FAIL | exactly one `VERDICT: FAIL`, or failing machine verification (checked first, so failing tests always reach the executor) |
+| BLOCKED | reviewer not independent / not read-only, turn aborted or errored, lifecycle missing, no verdict / both markers / a repeated marker, identity not established, notification history lost, attempt budget exhausted, executor thread could not be resumed |
 
 ## Not verified here
 
-- Production acceptance semantics in dashi: the Gate stops at `in_review` and
-  human acceptance is a separate, explicit call.
-- Reviewer and executor on *different* providers: the local provider proxy has no
-  per-thread routing, so both currently share one upstream. This MVP does not
+- Reviewer and executor on *different* providers: the local provider proxy has
+  no per-thread routing, so both currently share one upstream. This MVP does not
   require it, and the Gate treats the reviewer's model as unobserved.
-- `turn/start.outputSchema` enforcement. Measured on this build: the schema is
-  accepted and forwarded but not enforced on the tested provider route, so the
-  Gate does not depend on it. See `docs/LIVE-VERIFICATION-V0.3-WINDOWS.md`.
+- Production acceptance semantics in dashi: human acceptance is modelled as a
+  versioned move to `done` behind an explicit call, and `acceptTask` refuses
+  unless the task is `in_review` with a PASS verdict. That is a POC-level
+  convention, not a dashi workflow guarantee.
+- `thread/resume` for an executor thread whose rollout has been pruned, and
+  resuming a thread while another process holds it.

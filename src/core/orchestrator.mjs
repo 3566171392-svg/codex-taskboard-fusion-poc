@@ -31,13 +31,37 @@ export const TERMINAL_STATES = Object.freeze([
   STATES.IN_REVIEW,   // PASS already reached; only human acceptance remains
   STATES.DONE,
   STATES.BLOCKED,
+  STATES.CANCELED,
+]);
+
+/**
+ * The only statuses the Gate is allowed to start work from.
+ *
+ * `todo` is claimable and `in_progress`/`todo` (rejected) mean work is already
+ * under way on this task's binding. Everything else must fail closed:
+ *
+ *   backlog   dashi's own rule is that backlog is **not approved for
+ *             execution** — an assignee alone is not authorization. Treating it
+ *             as runnable would let the Gate start unapproved work.
+ *   canceled  the task will not continue; running it would resurrect it.
+ *   blocked   requires human intervention.
+ *   in_review PASS already reached; only human acceptance remains.
+ *   done      terminal.
+ *
+ * Unknown statuses are deliberately *not* runnable: a status this module does
+ * not understand is a reason to stop, never a reason to start.
+ */
+export const RUNNABLE_STATES = Object.freeze([
+  STATES.TODO,
+  STATES.IN_PROGRESS,
+  STATES.REJECTED,   // === "todo": rejected by review and awaiting repair
 ]);
 
 /**
  * Read the durable state of a task plus its attempt history.
  *
  * Returns `{ task, attempts, executorThreadId, resume }`. `resume.action` is one
- * of `run`, `await_human`, `blocked`, `done`.
+ * of `run`, `await_human`, `blocked`, `done`, `canceled`, `not_approved`.
  */
 export async function readTaskState({ taskboard, taskId }) {
   const task = await taskboard.getTask(taskId);
@@ -62,13 +86,7 @@ export async function readTaskState({ taskboard, taskId }) {
   const executorThreadId = task.threadBinding?.threadId ?? null;
   const lastAttempt = attempts.filter((a) => !a.malformed).at(-1) ?? null;
 
-  let action;
-  if (task.status === STATES.DONE) action = "done";
-  else if (task.status === STATES.BLOCKED) action = "blocked";
-  else if (task.status === STATES.IN_REVIEW) action = "await_human";
-  else if (task.status === STATES.IN_PROGRESS) action = "run";
-  else if (task.status === STATES.REJECTED) action = "run";
-  else action = "run";
+  const action = resolveResumeAction(task.status);
 
   return {
     task,
@@ -85,6 +103,24 @@ export async function readTaskState({ taskboard, taskId }) {
   };
 }
 
+/**
+ * Map a durable task status to what the orchestrator may do on resume.
+ *
+ * Fail closed: only `RUNNABLE_STATES` may run. The previous implementation ended
+ * with `else action = "run"`, so `backlog`, `canceled` and any status this
+ * module did not know about all fell through to "start executing".
+ */
+export function resolveResumeAction(status) {
+  if (RUNNABLE_STATES.includes(status)) return "run";
+  if (status === STATES.IN_REVIEW) return "await_human";
+  if (status === STATES.DONE) return "done";
+  if (status === STATES.BLOCKED) return "blocked";
+  if (status === STATES.CANCELED) return "canceled";
+  if (status === STATES.BACKLOG) return "not_approved";
+  // An unrecognized status is a stop condition, never an invitation to run.
+  return "unknown_status";
+}
+
 function describeResume(action, task, lastAttempt) {
   switch (action) {
     case "await_human":
@@ -93,6 +129,12 @@ function describeResume(action, task, lastAttempt) {
       return "task is done";
     case "blocked":
       return "task is blocked; requires human intervention";
+    case "canceled":
+      return "task is canceled; it will not continue";
+    case "not_approved":
+      return "task is in backlog, which is not approved for execution; a human must approve it first";
+    case "unknown_status":
+      return `task status "${task.status}" is not recognized; refusing to start work on it`;
     case "run":
       return `task is ${task.status}; the Gate may run`;
     default:
@@ -140,6 +182,12 @@ export async function runTaskThroughGate({
   requiredChecks = [],
   reviewScope = [],
   reviewTarget = null,
+  /**
+   * Resume the executor thread before doing any work. Default on: a restarted
+   * Fusion process must reattach to the thread the task is bound to rather than
+   * let the caller hand it a fresh one.
+   */
+  resumeExecutor = true,
 }) {
   const state = await readTaskState({ taskboard, taskId });
 
@@ -154,7 +202,49 @@ export async function runTaskThroughGate({
     };
   }
 
+  // ---- reattach to the bound executor thread -----------------------------
+  //
+  // Fusion stores only `task -> executorThreadId`. It does not replay a
+  // transcript and does not rebuild Codex context; `thread/resume` rejoins the
+  // thread and the conversation history stays where it lives — with Codex.
+  //
+  // Only a *restart* resumes. A first run has no durable attempt history and its
+  // executor thread was just created by the caller, so there is nothing to
+  // rejoin — and attempting to resume a thread that has not run a turn yet fails
+  // with `-32600 no rollout found`, which would turn every first run into
+  // BLOCKED. `state.attempts` is what distinguishes the two cases.
+  const attemptsUsed = state.attempts.filter((a) => !a.malformed).length;
+  const isRestart = attemptsUsed > 0;
+  const resumeResult = await resumeExecutorThread({
+    appServer,
+    state,
+    executor,
+    enabled: resumeExecutor && isRestart,
+    model,
+    modelProvider,
+  });
+  if (resumeResult.blocked) {
+    await taskboard.addComment(taskId, {
+      body: `Review Gate BLOCKED: could not resume the executor thread.\n${resumeResult.reason}`,
+      binding: executor.binding,
+    });
+    await taskboard.moveTask(taskId, STATES.BLOCKED, state.task.version, executor.binding);
+    return {
+      status: VERDICTS.BLOCKED,
+      resumed: true,
+      attemptedWork: false,
+      resumeAttempt: resumeResult,
+      task: await taskboard.getTask(taskId),
+      attempts: state.attempts,
+    };
+  }
+
   const task = state.task;
+  // Continue the durable attempt sequence. A restart must not hand the task a
+  // fresh budget of attempts, and the Taskboard must not end up with two records
+  // both numbered `attempt: 1`.
+  const firstAttempt = attemptsUsed + 1;
+
   const result = await executeNativeReviewGate({
     taskId,
     task,
@@ -169,6 +259,7 @@ export async function runTaskThroughGate({
     requiredChecks,
     reviewScope,
     reviewTarget,
+    firstAttempt,
     onReviewAttempt: async (record) => {
       await persistReviewAttempt({ taskboard, taskId, binding: executor.binding, record });
     },
@@ -179,9 +270,117 @@ export async function runTaskThroughGate({
     status: result.status,
     resumed: false,
     attemptedWork: true,
+    resumeAttempt: resumeResult,
     gate: result,
     task: finalTask,
     attempts: (await readTaskState({ taskboard, taskId })).attempts,
+  };
+}
+
+/**
+ * Reattach the caller's executor to the thread the task is bound to.
+ *
+ * Guarantees the caller cannot silently swap in a new executor thread:
+ *
+ *   1. the task must already carry an `executorThreadId`; otherwise this is a
+ *      brand-new task and the caller's binding is authoritative,
+ *   2. if the caller's binding names a *different* thread than the task does,
+ *      that is a conflict, not a resume — it means work would continue on the
+ *      wrong conversation, so it is refused,
+ *   3. the App Server must confirm the thread still exists,
+ *   4. the caller's binding is rewritten to the durable thread id, so any later
+ *      `thread/start`-style behaviour cannot drift away from it.
+ *
+ * Returns `{ blocked: false, ... }` on success or `{ blocked: true, reason }`.
+ */
+export async function resumeExecutorThread({
+  appServer,
+  state,
+  executor,
+  enabled = true,
+  model,
+  modelProvider = "custom",
+} = {}) {
+  const durableThreadId = state?.executorThreadId ?? null;
+  const bindingThreadId = executor?.binding?.threadId ?? null;
+
+  // Nothing on the board yet: a first run, where the caller's thread is the
+  // thing that will be persisted. There is nothing to rejoin.
+  if (!durableThreadId) {
+    return {
+      blocked: false,
+      resumed: false,
+      reason: "task carries no executor binding yet; this is a first run",
+      executorThreadId: bindingThreadId,
+      threadIdBefore: bindingThreadId,
+      threadIdAfter: bindingThreadId,
+      threadIdUnchanged: bindingThreadId === bindingThreadId,
+    };
+  }
+
+  if (bindingThreadId && bindingThreadId !== durableThreadId) {
+    return {
+      blocked: true,
+      reason:
+        `executor binding conflict: the task is bound to ${durableThreadId} ` +
+        `but the executor presented ${bindingThreadId}. Refusing to continue work on a ` +
+        "different thread than the one the task is bound to.",
+      durableThreadId,
+      bindingThreadId,
+    };
+  }
+
+  if (!enabled) {
+    return {
+      blocked: false,
+      resumed: false,
+      reason: "resume disabled by caller",
+      executorThreadId: durableThreadId,
+      threadIdBefore: bindingThreadId,
+      threadIdAfter: bindingThreadId ?? durableThreadId,
+      threadIdUnchanged: (bindingThreadId ?? durableThreadId) === durableThreadId,
+    };
+  }
+
+  if (!appServer?.resumeThread) {
+    return {
+      blocked: true,
+      reason: "no app server capable of thread/resume was supplied",
+      durableThreadId,
+    };
+  }
+
+  try {
+    await appServer.resumeThread({
+      threadId: durableThreadId,
+      model,
+      modelProvider,
+      sandbox: "workspace-write",
+    });
+  } catch (error) {
+    return {
+      blocked: true,
+      reason: `thread/resume failed for ${durableThreadId}: ${String(error)}`,
+      durableThreadId,
+    };
+  }
+
+  // The durable id wins. The caller keeps using the same thread object it
+  // already had, but it can no longer point at a different thread.
+  const before = executor.binding.threadId;
+  executor.binding.threadId = durableThreadId;
+  const after = executor.binding.threadId;
+  return {
+    blocked: false,
+    resumed: true,
+    reason: `resumed executor thread ${durableThreadId}`,
+    executorThreadId: durableThreadId,
+    // Reported, not asserted: for a normal restart `before` already equals the
+    // durable id, so this is true. It is false only when the caller presented no
+    // thread at all, which the trace should show rather than hide.
+    threadIdBefore: before,
+    threadIdAfter: after,
+    threadIdUnchanged: before === after,
   };
 }
 

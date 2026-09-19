@@ -24,8 +24,20 @@ class Board {
   async addComment(_id, c) { this.events.push({ type: "comment", body: c.body }); }
 }
 
-/** Fake app server that behaves like the real one for the Gate's purposes. */
-function fakeAppServer({ reviews, lifecycle = { entered: 1, exited: 1 }, turnStatus = "completed" }) {
+/**
+ * Fake app server that behaves like the real one for the Gate's purposes.
+ *
+ * `readThread` is the source of the Gate's identity evidence, so it must be
+ * present: a fake server that cannot report its own thread is exactly the
+ * "identity check with no evidence behind it" this revision fixed.
+ */
+function fakeAppServer({
+  reviews,
+  lifecycle = { entered: 1, exited: 1 },
+  turnStatus = "completed",
+  boundThreadId = "exec-A",
+  boundCwd = "D:/ws",
+}) {
   const calls = [];
   let turn = 0;
   let thread = 0;
@@ -36,6 +48,10 @@ function fakeAppServer({ reviews, lifecycle = { entered: 1, exited: 1 }, turnSta
       assert.equal(params.sandbox, "read-only", "reviewer thread must be read-only");
       thread += 1;
       return { thread: { id: `reviewer-${thread}` }, sandbox: { type: "readOnly" } };
+    },
+    async readThread({ threadId }) {
+      calls.push({ method: "thread/read", params: { threadId } });
+      return { thread: { id: boundThreadId, cwd: boundCwd } };
     },
     async startReview(params) {
       calls.push({ method: "review/start", params });
