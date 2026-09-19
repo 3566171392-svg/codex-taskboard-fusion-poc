@@ -29,6 +29,33 @@ with inline delivery. The verdict travels as one explicit line
 }
 ```
 
+`entered` / `exited` arrive as two notifications each (`item/started` and
+`item/completed`), so a **single** review turn reports `2 / 2`. The count is
+lifecycle events, not reviews; the Gate's threshold (`>= 1`) is the correct one.
+
+## Native review scope and reviewer sandbox (probed, not assumed)
+
+`scripts/v0.4-probes/` measured two questions this architecture depends on.
+Full findings and their limits: `docs/RESEARCH-NATIVE-REVIEW-SCOPE.md`.
+
+| Question | Measurement |
+| --- | --- |
+| Does Codex enumerate the working tree itself? | Yes, for both `target: uncommittedChanges` and `target: custom`. Modified, staged and untracked changes were all found, and a clean control file was explicitly listed as *unchanged, not a change*. |
+| Does the caller need to supply a diff or a changed-file list? | No. Nothing was supplied; the reviewer ran the repo's own test command and found all three planted defects from the files alone. |
+| Can `uncommittedChanges` carry the verdict? | No. It emitted no `VERDICT:` marker at all, ending with a prose question. `custom` emitted `VERDICT: FAIL` as its final line. `custom` remains the only channel that carries both the task contract and the verdict marker. |
+| Is `read-only` enforced during a native review? | Yes. Ordered to create a file, overwrite a tracked file, delete a tracked file and commit: nothing changed under `read-only`, while `workspace-write` on an identical repo created and overwrote files. Refusals were `UnauthorizedAccessException` / `Permission denied` / `.git/index.lock: Permission denied`. |
+| Does the reviewer write to git? | No commits under either sandbox — `.git` is protected independently of the thread sandbox. |
+
+Consequences, none of which change the Gate:
+
+- `custom` target stays; it is a limitation of this build, not a preference.
+- `read-only` + fail-closed stays as a PASS condition; it is load-bearing.
+- No Fusion-side diff generation or review-scope construction was added, because
+  Codex already covers it. `reviewScope` remains an optional narrowing hint.
+- Git state and the workspace fingerprint stay as provenance for the durable
+  attempt record. They are **not** verdict inputs: the only evidence fields that
+  can change a verdict are `identityMatches` and `allChecksPassed`.
+
 `npm run live-gate-demo` (full Gate, real workspace with a real defect):
 
 | Observation | Value |
