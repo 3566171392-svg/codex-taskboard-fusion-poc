@@ -1,0 +1,8 @@
+﻿# Normalize to LF in the repository so the scripts behave identically when
+# checked out on Linux/macOS.
+* text=auto eol=lf
+
+*.mjs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.png binary

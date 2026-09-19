@@ -1,0 +1,10 @@
+{
+  "taskboard": {
+    "baseUrl": "http://127.0.0.1:47823"
+  },
+  "codex": {
+    "executable": "codex",
+    "model": "<your-model>",
+    "modelProvider": "custom"
+  }
+}

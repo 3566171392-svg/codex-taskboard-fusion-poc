@@ -1,0 +1,16 @@
+{
+  "name": "codex-taskboard-fusion-poc",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "demo": "node scripts/mock-demo.mjs",
+    "live-app-server": "node scripts/live-app-server-smoke.mjs",
+    "live-native-review": "node scripts/live-native-review-smoke.mjs",
+    "make-demo-workspace": "node scripts/make-demo-workspace.mjs",
+    "live-gate-demo": "node scripts/live-gate-demo.mjs",
+    "lint": "node --check src/adapters/app-server-stdio.mjs && node --check src/adapters/taskboard-http.mjs && node --check src/core/review-gate.mjs && node --check src/core/review-contract.mjs && node --check src/core/evidence.mjs && node --check src/core/paths.mjs && node --check src/core/notification-log.mjs && node --check scripts/live-app-server-smoke.mjs && node --check scripts/live-native-review-smoke.mjs && node --check scripts/make-demo-workspace.mjs && node --check scripts/trust-demo-workspace.mjs && node --check scripts/live-gate-demo.mjs && node --check scripts/mock-demo.mjs"
+  }
+}

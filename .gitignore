@@ -1,0 +1,13 @@
+﻿# Runtime artifacts produced by the live scripts and probes.
+# They contain real thread ids and full model review output, so they are not
+# published. Re-run a live script to regenerate your own.
+.live-*.json
+
+# Local scratch
+*.local.json
+tmp/
+out/
+
+node_modules/
+*.log
+.DS_Store
